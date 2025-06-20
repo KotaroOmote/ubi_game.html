@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>スマホ傾きボールゲーム</title>
+
+  <!--CSS-->
+  <style>
+    body { font-family: Arial, sans-serif; text-align: center; background:#fafafa; margin:0; padding:0; }
+    canvas { border:2px solid #333; background:#fff; display:block; margin:20px auto; }
+    #ui { margin:12px; font-size:14px; }
+    button { padding:8px 16px; font-size:16px; border:none; border-radius:6px; background:#007bff; color:#fff; }
+    button:disabled{ background:#aaa; }
+    textarea.code { width:90%; height:480px; margin:20px auto; display:block; font-family:monospace; white-space: pre; overflow: auto; }
+
+    #time {
+      font-size: 28px;
+      font-weight: bold;
+      color: #d60000;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>傾きでボールをゴールへ！</h1>
+
+  <h2>使用したセンサーと目的</h2>
+  <p>
+    <strong>このWebページでは、スマートフォンの 加速度・角速度センサーを利用するために
+    <code>DeviceOrientationEvent</code> API を使用しています。</strong><br>
+    スマホの傾きを検出し、その値（<code>beta</code>: 前後の傾き、<code>gamma</code>: 左右の傾き）
+    に応じて青いボールを移動させます。<br>
+    プレイヤーはスマホを傾けながらボールを操作し、障害物を避けて赤いゴールに入れることで
+    ポイントを獲得します。<br>
+    これにより、人間の動作（デバイスの傾き）をリアルタイムにセンシングしています。<br>
+    API 詳細: <a href="https://developer.mozilla.org/ja/docs/Web/API/DeviceOrientationEvent" target="_blank">MDN Web Docs</a>
+  </p>
+
+  <!--UI-->
+  <div id="ui">
+    <p>スマホを傾けて <span style="color:blue">青いボール</span> を
+      <span style="color:red">赤いゴール</span> に導こう。<br>
+      制限時間 <b id="time">60</b> 秒内にできるだけ多くのゴールを目指せ！<br>
+      障害物に当たると <span style="color:red">-1 秒</span> ペナルティ。</p>
+    <button id="startBtn">スタート</button>
+    <div>スコア: <span id="score">0</span> ／ ハイスコア: <span id="best">0</span></div>
+  </div>
+
+  <canvas id="game" width="320" height="480"></canvas>
+
+  <!-- JavaScript -->
+  <script>
+    const canvas   = document.getElementById("game");
+    const ctx      = canvas.getContext("2d");
+    const startBtn = document.getElementById("startBtn");
+    const scoreEl  = document.getElementById("score");
+    const bestEl   = document.getElementById("best");
+    const timeEl   = document.getElementById("time");
+
+    /* --- ハイスコア読み込み --- */
+    let best = localStorage.getItem("tilt_best") || 0;
+    bestEl.textContent = best;
+
+    /* --- ゲーム定数／変数 --- */
+    const ball  = { x: 160, y: 240, r: 12, vx: 0, vy: 0 };
+    const goal  = { x: 260, y:  60, r: 18 };
+    const OBSTACLE_COUNT = 4;
+
+    let obstacles = [];
+    let tilt      = { beta: 0, gamma: 0 };
+    let playing   = false;
+    let timer     = 60;   // ← 60秒スタート
+    let score     = 0;
+    let frameId   = null;
+    let lastPenaltyTime = 0; // ペナルティ連発防止用（ms）
+
+    /* - 初期化関数 - */
+    function resetObstacles() {
+      obstacles = [];
+      for (let i = 0; i < OBSTACLE_COUNT; i++) {
+        const w = 60, h = 15;
+        const ox = Math.random() * (canvas.width  - w - 20) + 10;
+        const oy = Math.random() * (canvas.height - h - 20) + 10;
+        obstacles.push({ x: ox, y: oy, w: h, h: w }); // 縦長ブロック
+      }
+    }
+
+    function resetBall() {
+      ball.x = canvas.width / 2;
+      ball.y = canvas.height - 40;
+      ball.vx = ball.vy = 0;
+    }
+
+    function randomGoal() {
+      goal.x = Math.random() * (canvas.width  - 2 * goal.r - 20) + goal.r + 10;
+      goal.y = Math.random() * (canvas.height - 2 * goal.r - 20) + goal.r + 10;
+    }
+
+    /* - 描画 - */
+    function draw() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      /* ゴール */
+      ctx.beginPath();
+      ctx.arc(goal.x, goal.y, goal.r, 0, Math.PI * 2);
+      ctx.fillStyle = "red";
+      ctx.fill();
+
+      /* 障害物 */
+      ctx.fillStyle = "#555";
+      obstacles.forEach(o => ctx.fillRect(o.x, o.y, o.w, o.h));
+
+      /* ボール */
+      ctx.beginPath();
+      ctx.arc(ball.x, ball.y, ball.r, 0, Math.PI * 2);
+      ctx.fillStyle = "blue";
+      ctx.fill();
+    }
+
+    /* - ゲームループ - */
+    function update() {
+      /* ボール物理 */
+      ball.vx += tilt.gamma / 200;
+      ball.vy += tilt.beta  / 200;
+      ball.x  += ball.vx;
+      ball.y  += ball.vy;
+      ball.vx *= 0.98;
+      ball.vy *= 0.98;
+
+      /* 壁反射 */
+      if (ball.x < ball.r)                   { ball.x = ball.r;                     ball.vx *= -0.4; }
+      if (ball.x > canvas.width  - ball.r)   { ball.x = canvas.width  - ball.r;     ball.vx *= -0.4; }
+      if (ball.y < ball.r)                   { ball.y = ball.r;                     ball.vy *= -0.4; }
+      if (ball.y > canvas.height - ball.r)   { ball.y = canvas.height - ball.r;     ball.vy *= -0.4; }
+
+      /* 障害物衝突 → ペナルティ（1秒に1回まで） */
+      obstacles.forEach(o => {
+        if (
+          ball.x + ball.r > o.x && ball.x - ball.r < o.x + o.w &&
+          ball.y + ball.r > o.y && ball.y - ball.r < o.y + o.h
+        ) {
+          const now = Date.now();
+          if (now - lastPenaltyTime > 1000) {     // 1秒クールダウン
+            timer = Math.max(0, timer - 1);
+            timeEl.textContent = timer;
+            lastPenaltyTime = now;
+            if (navigator.vibrate) navigator.vibrate(100);
+          }
+          ball.vx *= -0.7;
+          ball.vy *= -0.7;
+        }
+      });
+
+      /* ゴール判定 */
+      const dx = ball.x - goal.x, dy = ball.y - goal.y;
+      if (Math.hypot(dx, dy) < ball.r + goal.r) {
+        score++;
+        scoreEl.textContent = score;
+        randomGoal();
+        resetObstacles();
+        if (navigator.vibrate) navigator.vibrate([50, 50, 50]);
+      }
+
+      /* 描画と次フレームへ */
+      draw();
+      frameId = requestAnimationFrame(update);
+    }
+
+    /* -- 1秒タイマー -- */
+    function tick() {
+      if (!playing) return;
+      timer--;
+      timeEl.textContent = timer;
+      if (timer <= 0) {
+        endGame();
+      } else {
+        setTimeout(tick, 1000);
+      }
+    }
+
+    /* -- ゲーム開始 -- */
+    function startGame() {
+      /* iOS 13+ 対応：ユーザー許可 */
+      if (typeof DeviceOrientationEvent !== "undefined" &&
+          typeof DeviceOrientationEvent.requestPermission === "function") {
+        DeviceOrientationEvent.requestPermission()
+          .then(state => state === "granted" ? actuallyStart() :
+                        alert("センサーへのアクセスが拒否されました"))
+          .catch(console.error);
+      } else {
+        actuallyStart();
+      }
+    }
+
+    function actuallyStart() {
+      playing = true;
+      timer   = 60;  
+      score   = 0;
+      scoreEl.textContent = score;
+      timeEl.textContent  = timer;
+      lastPenaltyTime     = 0;
+
+      resetBall();
+      randomGoal();
+      resetObstacles();
+
+      window.addEventListener("deviceorientation", orientationHandler, true);
+      update();
+      tick();
+      startBtn.disabled = true;
+    }
+
+    /* -- デバイス傾き取得 --- */
+    function orientationHandler(e) {
+      tilt.beta  = e.beta  - 90; // 縦向き端末用補正
+      tilt.gamma = e.gamma;
+    }
+
+    /* -- ゲーム終了 -- */
+    function endGame() {
+      playing = false;
+      cancelAnimationFrame(frameId);
+      window.removeEventListener("deviceorientation", orientationHandler, true);
+
+      if (score > best) {
+        best = score;
+        localStorage.setItem("tilt_best", best);
+        bestEl.textContent = best;
+      }
+
+      ctx.font = "32px Arial";
+      ctx.fillStyle = "green";
+      ctx.fillText("TIME UP!", 70, 240);
+      ctx.font = "24px Arial";
+      ctx.fillText("得点: " + score, 110, 280);
+
+      startBtn.disabled = false;
+    }
+
+    /* -- イベント -- */
+    startBtn.addEventListener("click", startGame);
+  </script>
+
+  <!-- ======= ソースコード表示（自動） ======= -->
+  <h2>このページのソースコード</h2>
+  <textarea class="code" readonly id="sourceArea"></textarea>
+
+  <script>
+    fetch(window.location.href)
+      .then(r => r.text())
+      .then(t => document.getElementById("sourceArea").textContent = t);
+  </script>
+</body>
+</html>
